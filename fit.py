@@ -1,64 +1,29 @@
 """
-NILUT: Conditional Neural Implicit 3D Lookup Tables for Image Enhancement
-https://github.com/mv-lab/nilut
+Training script for fitting Hald-to-Hald color transforms.
 
-Fit a complete 3D LUT into a simple NN.
+Supported architectures:
+- nilut: residual MLP baseline
+- siren: SIREN RGB regression baseline
+- geometric: SIREN backbone + 7D geometric transform head
 """
 
 import torch
-from torch import nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import numpy as np
-import matplotlib.pyplot as plt
 import gc
 from collections import defaultdict
 import argparse
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-use_amp = True
-scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
-start_time = None
+use_amp = torch.cuda.is_available()
+scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
 
 
-# Import NILUT utils
-from utils import start_timer, end_timer_and_print, clean_mem
-from utils import load_img, save_rgb, plot_all, pt_psnr, np_psnr, deltae_dist, count_parameters
-from dataloader import LUTFitting, MIT5KData
-from models.archs import SIREN, NILUT
-
-
-class NILUT(nn.Module):
-    """
-    Simple residual coordinate-based neural network for fitting 3D LUTs
-    Official code: https://github.com/mv-lab/nilut
-    """
-    def __init__(self, in_features=3, hidden_features=256, hidden_layers=3, out_features=3, res=True):
-        super().__init__()
-        
-        self.res = res
-        self.net = []
-        self.net.append(nn.Linear(in_features, hidden_features))
-        self.net.append(nn.ReLU())
-        
-        for _ in range(hidden_layers):
-            self.net.append(nn.Linear(hidden_features, hidden_features))
-            self.net.append(nn.Tanh())
-        
-        self.net.append(nn.Linear(hidden_features, out_features))
-        if not self.res:
-            self.net.append(torch.nn.Sigmoid())
-        
-        self.net = nn.Sequential(*self.net)
-    
-    def forward(self, intensity):
-        output = self.net(intensity)
-        if self.res:
-            output = output + intensity
-            output = torch.clamp(output, 0.,1.)
-        
-        return output, intensity
+from utils import start_timer, clean_mem
+from utils import save_rgb, plot_all, pt_psnr, np_psnr, deltae_dist, count_parameters
+from dataloader import LUTFitting
+from models.archs import SIREN, NILUT, GeometricNiLUT
 
 
 def fit(lut_model, total_steps, model_input, ground_truth, img_size, opt, verbose=200):
@@ -88,9 +53,14 @@ def fit(lut_model, total_steps, model_input, ground_truth, img_size, opt, verbos
         scaler.update()
         opt.zero_grad()
 
-    plt.plot(metrics['psnr'])
-    plt.title("PSNR Evolution")
-    plt.show()
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+
+        plt.plot(metrics['psnr'])
+        plt.title("PSNR Evolution")
+        plt.show()
+    except Exception:
+        print("Skipping PSNR plot (matplotlib not available).")
 
     print ("\n**Evaluate and get performance metrics\n")
     eval(model_input, model_output, ground_truth, img_size)
@@ -120,20 +90,15 @@ def eval(model_input, model_output, ground_truth, img_size):
     save_rgb(np_gt ,       f"results/gt.png")
 
 
-def main(inp_path, out_path, total_steps, lut_size):
+def main(inp_path, out_path, total_steps, lut_size, arch):
     """
-    Fit a professional 3D LUT into a simple coordinate-based MLP.
-    Complete tutorial at: https://github.com/mv-lab/nilut
-
-    - inp_path: Input RGB map as a hald image
-    - out_path: Enhanced RGB map as a hald image, after using the desired 3D LUT
-
+    Fit a color transform from source/target Hald pair.
     """
 
     torch.cuda.empty_cache()
     gc.collect()
 
-    print (f"Start NILUT {lut_size} fitting with")
+    print (f"Start fitting arch={arch}, hidden={lut_size}")
     print ("Input hald image:", inp_path)
     print ("Target hald image:", out_path)
 
@@ -144,15 +109,25 @@ def main(inp_path, out_path, total_steps, lut_size):
     print ("\nDataloader ready", img_size)
     
     # Define the model
-    lut_model = NILUT(in_features=3, out_features=3, hidden_features=lut_size[0], hidden_layers=lut_size[1])
-    lut_model.cuda()
+    if arch == "nilut":
+        lut_model = NILUT(in_features=3, out_features=3, hidden_features=lut_size[0], hidden_layers=lut_size[1])
+    elif arch == "siren":
+        # Baseline SIREN regression to RGB
+        lut_model = SIREN(in_features=3, out_features=3, hidden_features=lut_size[0], hidden_layers=lut_size[1], outermost_linear=True)
+    elif arch == "geometric":
+        # Predict 7D geometric params and apply quaternion sandwich rotation
+        lut_model = GeometricNiLUT(in_features=3, hidden_features=lut_size[0], hidden_layers=lut_size[1])
+    else:
+        raise ValueError(f"Unknown arch: {arch}")
+
+    lut_model = lut_model.to(device)
     opt = torch.optim.Adam(lr=1e-3, params=lut_model.parameters())
 
-    print (f"\nCreated NILUT model {lut_size} -- params={count_parameters(lut_model)}")
+    print (f"\nCreated model arch={arch} {lut_size} -- params={count_parameters(lut_model)}")
     
     # Load in memory the input and target hald images
     model_input_cpu, ground_truth_cpu = next(iter(dataloader))
-    model_input, ground_truth = model_input_cpu.cuda(), ground_truth_cpu.cuda()
+    model_input, ground_truth = model_input_cpu.to(device), ground_truth_cpu.to(device)
     print ("Input/Output shapes", model_input.shape, ground_truth.shape)
 
     lut_model.train()
@@ -163,9 +138,16 @@ def main(inp_path, out_path, total_steps, lut_size):
 parser = argparse.ArgumentParser(description='NILUT fitting')
 parser.add_argument("--input", help="Input RGB map as a hald image", default="", type=str)
 parser.add_argument("--target", help="Enhanced RGB map as a hald image, after using the desired 3D LUT", default="", type=str)
-parser.add_argument("--steps", help="Number of optimizaation steps", default=1000, type=int)
-parser.add_argument("--units", help="NILUT MLP architecture: number of neurons", default=128, type=int)
-parser.add_argument("--layers", help="NILUT MLP architecture: number of layers", default=2, type=int)
+parser.add_argument("--steps", help="Number of optimization steps", default=1000, type=int)
+parser.add_argument("--units", help="Number of hidden units", default=128, type=int)
+parser.add_argument("--layers", help="Number of hidden layers", default=2, type=int)
+parser.add_argument(
+    "--arch",
+    help="Model architecture: nilut | siren | geometric",
+    default="nilut",
+    type=str,
+    choices=["nilut", "siren", "geometric"],
+)
 
 
 if __name__ == "__main__":
@@ -175,4 +157,5 @@ if __name__ == "__main__":
     main(inp_path=args.input, 
          out_path=args.target,
          total_steps=args.steps,
-         lut_size=(args.units, args.layers))
+         lut_size=(args.units, args.layers),
+         arch=args.arch)

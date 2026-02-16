@@ -1,17 +1,18 @@
 """
 NILUT: Conditional Neural Implicit 3D Lookup Tables for Image Enhancement
 
-Utils for training and ploting
+Utility helpers for training, plotting, and metrics.
 """
 
 import torch
 import cv2
 from PIL import Image
-import matplotlib.pyplot as plt
 import numpy as np
 import gc
 import time
 from skimage import io, color
+
+plt = None  # lazily imported inside plot_all()
 
 
 # Timing utilities
@@ -62,6 +63,16 @@ def save_rgb (img, filename):
     cv2.imwrite(filename, img)
 
 def plot_all (images, figsize=(20,10), axis='off', title=None):
+
+    global plt
+    if plt is None:
+        try:
+            import matplotlib.pyplot as _plt  # type: ignore
+
+            plt = _plt
+        except Exception:
+            print("plot_all skipped: matplotlib is not available in this environment.")
+            return
 
     nplots = len(images)
     fig, axs = plt.subplots(1,nplots, figsize=figsize, dpi=80,constrained_layout=True)
