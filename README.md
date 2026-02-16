@@ -17,6 +17,7 @@ keeping the same input/output interface used by NILUT fitting (`[B, 3] -> [B, 3]
 - `--arch nilut`: original residual MLP (`NILUT`)
 - `--arch siren`: SIREN baseline (RGB regression)
 - `--arch geometric`: `GeometricNiLUT` (SIREN backbone + geometric transform head)
+- `--arch geometric_affine`: `GeometricAffineNiLUT` (full 3x3 affine + translation)
 
 ## GeometricNiLUT (implemented)
 
@@ -46,6 +47,64 @@ Forward transformation:
 
 All quaternion operations are implemented in PyTorch (`torch`) inside `models/archs.py`.
 
+## Geometric A/B result summary
+
+Latest A/B run compares:
+
+- `geometric` (7-DoF: scale + rotor + translation)
+- `geometric_affine` (12-DoF: full affine matrix + translation)
+
+Model intent:
+
+- `geometric`: constrained local conformal transform (rotation + uniform scaling + translation)
+- `geometric_affine`: unconstrained local linear transform (allows shear and non-uniform scaling)
+
+Run setup:
+
+- Target transform: `LUT01_ContrastLUT`
+- Steps: `3000`
+- Hidden size / depth: `256 / 3`
+- Script: `run_ab_experiments.py`
+- Device: CUDA (`torch 2.0.1+cu118`) on RTX 3090
+
+Final metrics:
+
+| Arch | Params | PSNR | DeltaE | Max Error |
+| --- | ---: | ---: | ---: | ---: |
+| `geometric` | 200,199 | **52.9287** | **0.4836** | **0.0175** |
+| `geometric_affine` | 201,484 | 51.8299 | 0.5132 | 0.0196 |
+
+Training behavior snapshot:
+
+- `geometric`:
+  - starts at `23.26 dB` (step 0), ends at `52.93 dB` (step 2999)
+  - temporary spike around step `1800` (`41.15 dB`) but recovers
+- `geometric_affine`:
+  - starts at `23.24 dB` (step 0), ends at `51.83 dB` (step 2999)
+  - temporary drop around step `1800` (`49.77 dB`) and partial recovery
+
+Interpretation for this target (`LUT01_ContrastLUT`):
+
+- The constrained conformal model (`geometric`) gave better final metrics than the higher-DoF affine model.
+- This suggests the target mapping is sufficiently captured by rotor+scale+translation, and extra affine freedom did not improve final quality in this run.
+- This is one target-specific result, not a global conclusion across all LUT styles.
+
+Recommended follow-up checks:
+
+- Repeat on multiple LUT targets (`LUT02`, `LUT03`, `LUT04`, ...).
+- Keep seed, steps, and hidden size fixed for fair A/B comparison.
+- Evaluate visual artifacts on ramps/noise images in addition to PSNR/DeltaE.
+
+Logs:
+
+- `results/logs/geometric_3000.log`
+- `results/logs/geometric_affine_3000.log`
+
+Weights:
+
+- `weights_GeometricNiLUT.pt`
+- `weights_GeometricAffineNiLUT.pt`
+
 ## Data requirement for fitting
 
 `fit.py` expects a pair of Hald images:
@@ -66,6 +125,14 @@ python fit.py --arch siren --input <input_hald.png> --target <target_hald.png> -
 
 # Geometric model
 python fit.py --arch geometric --input <input_hald.png> --target <target_hald.png> --steps 1000 --units 128 --layers 2
+
+# Geometric affine model
+python fit.py --arch geometric_affine --input <input_hald.png> --target <target_hald.png> --steps 1000 --units 128 --layers 2
+```
+
+```bash
+# Run geometric vs affine A/B in one command
+python run_ab_experiments.py --steps 3000 --units 256 --layers 3
 ```
 
 Notes:
