@@ -6,6 +6,8 @@
 !nilut.ipynb
 
 dataset/*.png
+dataset/**
+!dataset/.gitkeep
 fulldata/
 results/
 
